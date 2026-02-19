@@ -1,0 +1,91 @@
+name: Deploy to Bunny CDN Storage
+
+on:
+  workflow_call:
+    inputs:
+      build_command:
+        description: "Command to build static files"
+        required: true
+        type: string
+      dist_path:
+        description: "Local path to built files (e.g. dist/links)"
+        required: true
+        type: string
+      storage_path:
+        description: "Path prefix in Storage Zone (e.g. /links)"
+        required: true
+        type: string
+      pull_zone_id:
+        description: "Bunny CDN Pull Zone ID for cache purge"
+        required: true
+        type: string
+      php_version:
+        description: "PHP version for build (default: 8.3)"
+        required: false
+        type: string
+        default: "8.3"
+    secrets:
+      BUNNY_STORAGE_API_KEY:
+        required: true
+      BUNNY_STORAGE_ZONE:
+        required: true
+      BUNNY_CDN_API_KEY:
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php_version }}
+          extensions: curl, json
+
+      - name: Build
+        run: ${{ inputs.build_command }}
+
+      - name: Upload to Bunny Storage
+        run: |
+          STORAGE_ZONE="${{ secrets.BUNNY_STORAGE_ZONE }}"
+          STORAGE_KEY="${{ secrets.BUNNY_STORAGE_API_KEY }}"
+          STORAGE_PATH="${{ inputs.storage_path }}"
+          DIST_PATH="${{ inputs.dist_path }}"
+
+          # Upload each file
+          find "$DIST_PATH" -type f | while read -r file; do
+            relative="${file#$DIST_PATH/}"
+            remote_path="${STORAGE_PATH%/}/${relative}"
+
+            echo "Uploading: ${remote_path}"
+            curl -s --fail \
+              -X PUT \
+              -H "AccessKey: ${STORAGE_KEY}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@${file}" \
+              "https://storage.bunnycdn.com/${STORAGE_ZONE}${remote_path}"
+          done
+
+          echo "Upload complete."
+
+      - name: Purge CDN Cache
+        run: |
+          STORAGE_PATH="${{ inputs.storage_path }}"
+
+          # Purge the specific path
+          curl -s --fail \
+            -X POST \
+            -H "AccessKey: ${{ secrets.BUNNY_CDN_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            "https://api.bunny.net/pullzone/${{ inputs.pull_zone_id }}/purgeCache" \
+            -d "{\"CacheTag\": \"${STORAGE_PATH}\"}" || true
+
+          # Fallback: purge entire zone if tag purge not supported
+          curl -s --fail \
+            -X POST \
+            -H "AccessKey: ${{ secrets.BUNNY_CDN_API_KEY }}" \
+            "https://api.bunny.net/pullzone/${{ inputs.pull_zone_id }}/purgeCache"
+
+          echo "Cache purged."
